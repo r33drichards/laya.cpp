@@ -59,6 +59,9 @@ and [benchmarking instructions](docs/benchmarking.md) for identities and reprodu
 
 ## Build
 
+Configure with `-DLAYA_METAL=ON` on Apple hardware for the Metal backend; it is faster
+than CPU FP32 but does not meet the tolerance in [docs/precision.md](docs/precision.md).
+
 Requires a C++20 compiler, CMake 3.24+, CUDA, ICU, and nlohmann-json. On Debian-like
 systems the host dependencies are `libicu-dev` and `nlohmann-json3-dev`.
 

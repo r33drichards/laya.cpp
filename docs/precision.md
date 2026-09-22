@@ -6,6 +6,38 @@ exactly and public numeric outputs must differ by no more than 0.0001.
 Comparisons use identical request groups, batch sizes and padding. Differences
 between precision modes are model behavior, not porting errors.
 
+## Apple Metal
+
+Metal is an accelerated backend, not an exact one. It does not meet the tolerance
+stated above, and is the only supported backend that does not.
+
+The runtime marks every FP32 projection for FP32 accumulation with
+`ggml_prec_set_acc(value, GGML_PREC_F32)` (`src/runtime.cpp`). The CUDA backend
+honours that request (`ggml-cuda.cu`, `dst->op_params[0] == GGML_PREC_F32`). The
+Metal backend has no notion of it — `GGML_PREC` does not appear anywhere in
+`third_party/ggml/src/ggml-metal/` — so the request is silently discarded and the
+matmuls accumulate at whatever precision the kernel chooses.
+
+Measured on an Apple M3 against this build's own CPU FP32 path, over a
+20-question fixture of `noul`, `score` and `choice` requests:
+
+| Quantity | Result |
+|---|---|
+| Categories (`choice`) | exact agreement |
+| Public numeric outputs within 0.0001 | 11 of 16 |
+| Worst absolute deviation | 0.0011 |
+| Latency per decision | 0.103 s, against 0.533 s on CPU FP32 |
+
+So Metal keeps the decisions and loses the last two digits of the probabilities.
+That is a sound trade for filtering and ranking, where the choice is what matters,
+and the wrong one for reproducing published numbers or validating a port: use CPU
+FP32 or CUDA for those. Closing the gap means teaching `ggml-metal` to respect
+`GGML_PREC_F32`, which is upstream kernel work.
+
+The custom ops have no Metal kernels. `ggml_backend_sched` places them on an
+accompanying CPU backend and runs the rest of the graph on the GPU, so enabling
+Metal required no new kernels.
+
 ## Native BF16
 
 Select `--bf16` for native mixed-precision inference. The older

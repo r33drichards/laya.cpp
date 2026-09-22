@@ -28,8 +28,8 @@ std::string clean(std::string text, const std::string& mask) {
 bool empty(const json& x) { return x.is_null() || (x.is_string() && x.get<std::string>().empty()); }
 double rounded(double x) { return std::nearbyint(x*10000.0)/10000.0; }
 }
-agent::agent(const std::filesystem::path& directory, bool cuda, bool bf16, bool flash, bool tensor_core)
-    : model(directory, cuda, bf16, flash, tensor_core), tok(directory / "tokenizer/tokenizer.json") {
+agent::agent(const std::filesystem::path& directory, bool cuda, bool bf16, bool flash, bool tensor_core, bool metal)
+    : model(directory, cuda, bf16, flash, tensor_core, metal), tok(directory / "tokenizer/tokenizer.json") {
     std::ifstream f(directory / "tokenizer/tokenizer_config.json"); settings = json::parse(f);
 }
 std::string agent::backend_name() const { return model.backend_name(); }
