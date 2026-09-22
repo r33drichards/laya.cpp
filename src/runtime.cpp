@@ -8,6 +8,9 @@
 #include "ggml-cuda.h"
 const char* laya_cuda_bf16_compatibility_error();
 #endif
+#ifdef LAYA_METAL
+#include "ggml-metal.h"
+#endif
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -30,6 +33,7 @@ json read_json(const std::filesystem::path& path) {
 struct graph_state {
     ggml_context* ctx = nullptr;
     ggml_gallocr_t allocator = nullptr;
+    ggml_backend_sched_t sched = nullptr;
     ggml_cgraph* graph = nullptr;
     tensor *lengths = nullptr;
     tensor *ids = nullptr, *types = nullptr, *markers = nullptr, *cls = nullptr;
@@ -39,7 +43,7 @@ struct graph_state {
     std::vector<std::pair<std::string, tensor*>> traces;
     int batch = 0, length = 0, options = 0;
     bool padding=false;
-    ~graph_state() { if (allocator) ggml_gallocr_free(allocator); if (ctx) ggml_free(ctx); }
+    ~graph_state() { if (sched) ggml_backend_sched_free(sched); if (allocator) ggml_gallocr_free(allocator); if (ctx) ggml_free(ctx); }
 };
 }
 struct runtime::impl {
@@ -51,6 +55,9 @@ struct runtime::impl {
     std::set<std::string> compensated_weights;
     std::unique_ptr<graph_state> main_graph, action_graph;
     bool bf16, flash, tensor_core;
+    bool metal = false;
+    // Second backend for the Metal scheduler: laya's GGML_OP_CUSTOM nodes are CPU-only.
+    ggml_backend_t cpu_backend = nullptr;
     int width = 1024, heads = 16, layers = 28, intermediate = 2624, vocabulary = 50368, n_actions;
     float local_rope = 10000.f;
 
@@ -59,9 +66,11 @@ struct runtime::impl {
         if (weight_buffer) ggml_backend_buffer_free(weight_buffer);
         if (weight_context) ggml_free(weight_context);
         if (backend) ggml_backend_free(backend);
+        if (cpu_backend) ggml_backend_free(cpu_backend);
     }
 
-    void load(const std::filesystem::path& directory, bool cuda) {
+    void load(const std::filesystem::path& directory, bool cuda, bool use_metal) {
+        metal = use_metal;
         // The CUDA backend enables TF32 in cuBLAS by default. Strict FP32 must
         // disable that permission before CUDA/cuBLAS initialization.
         if (cuda && !bf16 && setenv("NVIDIA_TF32_OVERRIDE", "0", 1) != 0)
@@ -105,7 +114,18 @@ struct runtime::impl {
 #else
         if (cuda) throw std::runtime_error("This build has no CUDA backend");
 #endif
-        if (!cuda) backend = ggml_backend_cpu_init();
+#ifdef LAYA_METAL
+        if (metal) {
+            backend = ggml_backend_metal_init();
+            // The custom ops have no Metal kernels, so a CPU backend always
+            // accompanies Metal and the scheduler places those nodes on it.
+            if (backend && !(cpu_backend = ggml_backend_cpu_init()))
+                throw std::runtime_error("Cannot initialize the CPU backend required by Metal");
+        }
+#else
+        if (metal) throw std::runtime_error("This build has no Metal backend");
+#endif
+        if (!cuda && !metal) backend = ggml_backend_cpu_init();
         if (!backend) throw std::runtime_error("Cannot initialize requested backend");
 
         std::ifstream file(directory / "model.safetensors", std::ios::binary | std::ios::ate);
@@ -382,11 +402,21 @@ struct runtime::impl {
             ggml_build_forward_expand(s.graph, s.pooled);
             ggml_build_forward_expand(s.graph, s.logits);
         }
-        for (int i = 0; i < ggml_graph_n_nodes(s.graph); ++i)
-            if (!ggml_backend_supports_op(backend, ggml_graph_node(s.graph, i)))
-                throw std::runtime_error(std::string("Requested backend does not support ") + ggml_op_name(ggml_graph_node(s.graph, i)->op));
-        s.allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
-        if (!ggml_gallocr_alloc_graph(s.allocator, s.graph)) throw std::runtime_error("Insufficient memory for this batch");
+        if (cpu_backend) {
+            // Metal runs the tensor algebra; the scheduler falls the custom ops
+            // back to the CPU backend. Allocating once keeps the constants that
+            // are written below resident, exactly as the gallocr path does.
+            ggml_backend_t backends[]{backend, cpu_backend};
+            s.sched = ggml_backend_sched_new(backends, nullptr, 2, ggml_graph_size(s.graph), false, false);
+            if (!s.sched) throw std::runtime_error("Cannot create the Metal/CPU scheduler");
+            if (!ggml_backend_sched_alloc_graph(s.sched, s.graph)) throw std::runtime_error("Insufficient memory for this batch");
+        } else {
+            for (int i = 0; i < ggml_graph_n_nodes(s.graph); ++i)
+                if (!ggml_backend_supports_op(backend, ggml_graph_node(s.graph, i)))
+                    throw std::runtime_error(std::string("Requested backend does not support ") + ggml_op_name(ggml_graph_node(s.graph, i)->op));
+            s.allocator = ggml_gallocr_new(ggml_backend_get_default_buffer_type(backend));
+            if (!ggml_gallocr_alloc_graph(s.allocator, s.graph)) throw std::runtime_error("Insufficient memory for this batch");
+        }
         if (!action) {
             for (int kind = 0; kind < 2; ++kind) {
                 std::vector<float> cosine(64*s.length), sine(64*s.length);
@@ -441,7 +471,8 @@ struct runtime::impl {
         put(s.types, types); put(s.cls, cls);
         put(s.lengths, input.lengths);
         auto start = std::chrono::steady_clock::now();
-        if (ggml_backend_graph_compute(backend, s.graph) != GGML_STATUS_SUCCESS) throw std::runtime_error("Encoder computation failed");
+        if ((s.sched ? ggml_backend_sched_graph_compute(s.sched, s.graph)
+                     : ggml_backend_graph_compute(backend, s.graph)) != GGML_STATUS_SUCCESS) throw std::runtime_error("Encoder computation failed");
         raw_result result;
         result.action_count = n_actions;
         result.logits.resize(input.size * input.options);
@@ -477,18 +508,20 @@ struct runtime::impl {
             out[width+3] = float(std::max(2, input.counts[row]))/255.0f;
         }
         put(action_graph->action_input, features);
-        if (ggml_backend_graph_compute(backend, action_graph->graph) != GGML_STATUS_SUCCESS) throw std::runtime_error("Action computation failed");
+        if ((action_graph->sched ? ggml_backend_sched_graph_compute(action_graph->sched, action_graph->graph)
+                                 : ggml_backend_graph_compute(backend, action_graph->graph)) != GGML_STATUS_SUCCESS) throw std::runtime_error("Action computation failed");
         result.actions.resize(input.size*n_actions);
         ggml_backend_tensor_get(action_graph->action_output, result.actions.data(), 0, ggml_nbytes(action_graph->action_output));
         result.compute_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now()-start).count();
         return result;
     }
 };
-runtime::runtime(const std::filesystem::path& path, bool cuda, bool bf16, bool flash, bool tensor_core) : p(std::make_unique<impl>()) {
+runtime::runtime(const std::filesystem::path& path, bool cuda, bool bf16, bool flash, bool tensor_core, bool metal) : p(std::make_unique<impl>()) {
+    if (cuda && metal) throw std::invalid_argument("CUDA and Metal cannot be used together");
     if (bf16 && (!cuda || !flash)) throw std::invalid_argument("BF16 mode requires fused CUDA attention");
     if (tensor_core && (bf16 || !cuda)) throw std::invalid_argument("Compensated Tensor Cores require CUDA and FP32 mode");
     p->bf16 = bf16; p->flash = flash; p->tensor_core = tensor_core;
-    p->load(path, cuda);
+    p->load(path, cuda, metal);
 }
 runtime::~runtime() = default;
 raw_result runtime::forward(const batch& input) { return p->run(input); }
